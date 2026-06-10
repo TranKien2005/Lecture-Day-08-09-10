@@ -6,3 +6,10 @@
 day08/lab/data/grading_questions.json
 day09/lab/data/grading_questions.json
 day10/lab/data/grading_questions.json
+
+# Local secrets and generated vector stores
+.env
+**/.env
+**/chroma_db/
+**/__pycache__/
+**/.venv/

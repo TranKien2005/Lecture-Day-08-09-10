@@ -112,5 +112,38 @@ def run_expectations(cleaned_rows: List[Dict[str, Any]]) -> Tuple[List[Expectati
         )
     )
 
+    # E7: phải publish đủ các nguồn cần cho grading, bao gồm access_control_sop.
+    required_doc_ids = {
+        "policy_refund_v4",
+        "sla_p1_2026",
+        "it_helpdesk_faq",
+        "hr_leave_policy",
+        "access_control_sop",
+    }
+    present_doc_ids = {r.get("doc_id") for r in cleaned_rows}
+    missing_doc_ids = sorted(required_doc_ids - present_doc_ids)
+    ok7 = not missing_doc_ids
+    results.append(
+        ExpectationResult(
+            "required_doc_ids_present_for_grading",
+            ok7,
+            "halt",
+            f"missing_doc_ids={missing_doc_ids}",
+        )
+    )
+
+    # E8: chunk_id phải unique để embed idempotent và prune chính xác.
+    chunk_ids = [r.get("chunk_id") for r in cleaned_rows]
+    duplicate_chunk_ids = len(chunk_ids) - len(set(chunk_ids))
+    ok8 = duplicate_chunk_ids == 0
+    results.append(
+        ExpectationResult(
+            "unique_chunk_id",
+            ok8,
+            "halt",
+            f"duplicate_chunk_ids={duplicate_chunk_ids}",
+        )
+    )
+
     halt = any(not r.passed and r.severity == "halt" for r in results)
     return results, halt

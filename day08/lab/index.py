@@ -34,6 +34,28 @@ CHROMA_DB_DIR = Path(__file__).parent / "chroma_db"
 CHUNK_SIZE = 400       # tokens (ước lượng bằng số ký tự / 4)
 CHUNK_OVERLAP = 80     # tokens overlap giữa các chunk
 
+# Embedding provider:
+# - local: Sentence Transformers, chạy được không cần API key
+# - openai: text-embedding-3-small hoặc model cấu hình qua env
+# - openrouter: OpenRouter-compatible embeddings endpoint
+EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "local").lower()
+LOCAL_EMBEDDING_MODEL = os.getenv(
+    "LOCAL_EMBEDDING_MODEL",
+    "paraphrase-multilingual-MiniLM-L12-v2",
+)
+OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+OPENROUTER_API_BASE = os.getenv("OPENROUTER_API_BASE", "https://openrouter.ai/api/v1")
+OPENROUTER_EMBEDDING_MODEL = os.getenv(
+    "OPENROUTER_EMBEDDING_MODEL",
+    "openrouter/openai/text-embedding-3-small",
+)
+
+_local_embedding_model = None
+
+
+def _has_real_api_key(value: Optional[str]) -> bool:
+    return bool(value and value.strip() and value.strip() not in {"sk-...", "...", "your_api_key_here"})
+
 
 # =============================================================================
 # STEP 1: PREPROCESS
@@ -224,27 +246,52 @@ def get_embedding(text: str) -> List[float]:
     """
     Tạo embedding vector cho một đoạn text.
 
-    TODO Sprint 1:
-    Chọn một trong hai:
-
-    Option A — OpenAI Embeddings (cần OPENAI_API_KEY):
-        from openai import OpenAI
-        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        response = client.embeddings.create(
-            input=text,
-            model="text-embedding-3-small"
-        )
-        return response.data[0].embedding
-
-    Option B — Sentence Transformers (chạy local, không cần API key):
-        from sentence_transformers import SentenceTransformer
-        model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
-        return model.encode(text).tolist()
+    Mặc định dùng Sentence Transformers local để lab chạy được không cần API key.
+    Nếu đặt EMBEDDING_PROVIDER=openai và có OPENAI_API_KEY, hàm sẽ dùng OpenAI
+    embeddings. Dùng cùng hàm này cho cả indexing và query để tránh lệch vector
+    dimension giữa build_index() và retrieve_dense().
     """
-    raise NotImplementedError(
-        "TODO: Implement get_embedding().\n"
-        "Chọn Option A (OpenAI) hoặc Option B (Sentence Transformers) trong TODO comment."
-    )
+    global _local_embedding_model
+
+    provider = EMBEDDING_PROVIDER
+    if provider == "openai":
+        api_key = os.getenv("OPENAI_API_KEY")
+        if _has_real_api_key(api_key):
+            from openai import OpenAI
+
+            client = OpenAI(api_key=api_key)
+            response = client.embeddings.create(
+                input=text,
+                model=OPENAI_EMBEDDING_MODEL,
+            )
+            return response.data[0].embedding
+
+        print("[embedding] OPENAI_API_KEY missing — fallback về Sentence Transformers local.")
+
+    if provider == "openrouter":
+        api_key = os.getenv("OPENROUTER_API_KEY")
+        if _has_real_api_key(api_key):
+            from openai import OpenAI
+
+            client = OpenAI(
+                api_key=api_key,
+                base_url=OPENROUTER_API_BASE,
+            )
+            response = client.embeddings.create(
+                input=text,
+                model=OPENROUTER_EMBEDDING_MODEL,
+            )
+            return response.data[0].embedding
+
+        print("[embedding] OPENROUTER_API_KEY missing — fallback về Sentence Transformers local.")
+
+    if _local_embedding_model is None:
+        from sentence_transformers import SentenceTransformer
+
+        print(f"[embedding] Loading local model: {LOCAL_EMBEDDING_MODEL}")
+        _local_embedding_model = SentenceTransformer(LOCAL_EMBEDDING_MODEL)
+
+    return _local_embedding_model.encode(text).tolist()
 
 
 def build_index(docs_dir: Path = DOCS_DIR, db_dir: Path = CHROMA_DB_DIR) -> None:
@@ -272,14 +319,23 @@ def build_index(docs_dir: Path = DOCS_DIR, db_dir: Path = CHROMA_DB_DIR) -> None
     import chromadb
 
     print(f"Đang build index từ: {docs_dir}")
+    print(f"Embedding provider: {EMBEDDING_PROVIDER}")
     db_dir.mkdir(parents=True, exist_ok=True)
 
-    # TODO: Khởi tạo ChromaDB
-    # client = chromadb.PersistentClient(path=str(db_dir))
-    # collection = client.get_or_create_collection(...)
+    client = chromadb.PersistentClient(path=str(db_dir))
+    try:
+        client.delete_collection("rag_lab")
+        print("Đã xóa collection rag_lab cũ để rebuild sạch.")
+    except Exception:
+        pass
+
+    collection = client.get_or_create_collection(
+        name="rag_lab",
+        metadata={"hnsw:space": "cosine"},
+    )
 
     total_chunks = 0
-    doc_files = list(docs_dir.glob("*.txt"))
+    doc_files = sorted(docs_dir.glob("*.txt"))
 
     if not doc_files:
         print(f"Không tìm thấy file .txt trong {docs_dir}")
@@ -288,33 +344,35 @@ def build_index(docs_dir: Path = DOCS_DIR, db_dir: Path = CHROMA_DB_DIR) -> None
     for filepath in doc_files:
         print(f"  Processing: {filepath.name}")
         raw_text = filepath.read_text(encoding="utf-8")
-
-        # TODO: Gọi preprocess_document
-        # doc = preprocess_document(raw_text, str(filepath))
-
-        # TODO: Gọi chunk_document
-        # chunks = chunk_document(doc)
-
-        # TODO: Embed và lưu từng chunk vào ChromaDB
-        # for i, chunk in enumerate(chunks):
-        #     chunk_id = f"{filepath.stem}_{i}"
-        #     embedding = get_embedding(chunk["text"])
-        #     collection.upsert(
-        #         ids=[chunk_id],
-        #         embeddings=[embedding],
-        #         documents=[chunk["text"]],
-        #         metadatas=[chunk["metadata"]],
-        #     )
-        # total_chunks += len(chunks)
-
-        # Placeholder để code không lỗi khi chưa implement
         doc = preprocess_document(raw_text, str(filepath))
         chunks = chunk_document(doc)
-        print(f"    → {len(chunks)} chunks (embedding chưa implement)")
+
+        ids = []
+        documents = []
+        metadatas = []
+        embeddings = []
+
+        for i, chunk in enumerate(chunks):
+            chunk_id = f"{filepath.stem}_{i}"
+            ids.append(chunk_id)
+            documents.append(chunk["text"])
+            metadatas.append(chunk["metadata"])
+            embeddings.append(get_embedding(chunk["text"]))
+
+        if ids:
+            collection.upsert(
+                ids=ids,
+                embeddings=embeddings,
+                documents=documents,
+                metadatas=metadatas,
+            )
+
+        print(f"    → {len(chunks)} chunks indexed")
         total_chunks += len(chunks)
 
-    print(f"\nHoàn thành! Tổng số chunks: {total_chunks}")
-    print("Lưu ý: Embedding chưa được implement. Xem TODO trong get_embedding() và build_index().")
+    print(f"\nHoàn thành! Tổng số chunks đã index: {total_chunks}")
+    print(f"ChromaDB path: {db_dir}")
+    print(f"Collection count: {collection.count()}")
 
 
 # =============================================================================
@@ -418,20 +476,14 @@ if __name__ == "__main__":
             print(f"\n  [Chunk {i+1}] Section: {chunk['metadata']['section']}")
             print(f"  Text: {chunk['text'][:150]}...")
 
-    # Bước 3: Build index (yêu cầu implement get_embedding)
+    # Bước 3: Build index
     print("\n--- Build Full Index ---")
-    print("Lưu ý: Cần implement get_embedding() trước khi chạy bước này!")
-    # Uncomment dòng dưới sau khi implement get_embedding():
-    # build_index()
+    build_index()
 
     # Bước 4: Kiểm tra index
-    # Uncomment sau khi build_index() thành công:
-    # list_chunks()
-    # inspect_metadata_coverage()
+    print("\n--- Inspect Index ---")
+    list_chunks()
+    inspect_metadata_coverage()
 
     print("\nSprint 1 setup hoàn thành!")
-    print("Việc cần làm:")
-    print("  1. Implement get_embedding() - chọn OpenAI hoặc Sentence Transformers")
-    print("  2. Implement phần TODO trong build_index()")
-    print("  3. Chạy build_index() và kiểm tra với list_chunks()")
-    print("  4. Nếu chunking chưa tốt: cải thiện _split_by_size() để split theo paragraph")
+    print("Bạn có thể chạy tiếp: python rag_answer.py")

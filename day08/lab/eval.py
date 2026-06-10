@@ -24,6 +24,41 @@ from typing import List, Dict, Any, Optional
 from datetime import datetime
 from rag_answer import rag_answer
 
+
+def _tokens(text: str) -> set:
+    import re
+    return set(re.findall(r"[\w-]+", (text or "").lower()))
+
+
+def _keyword_overlap_score(answer: str, expected_answer: str) -> Dict[str, Any]:
+    expected_tokens = {t for t in _tokens(expected_answer) if len(t) > 2}
+    answer_tokens = _tokens(answer)
+    if not expected_tokens:
+        return {"score": None, "overlap": None}
+    overlap = len(expected_tokens & answer_tokens) / len(expected_tokens)
+    if overlap >= 0.75:
+        score = 5
+    elif overlap >= 0.55:
+        score = 4
+    elif overlap >= 0.35:
+        score = 3
+    elif overlap >= 0.2:
+        score = 2
+    else:
+        score = 1
+    return {"score": score, "overlap": overlap}
+
+
+def _is_insufficient_answer(answer: str) -> bool:
+    text = (answer or "").lower()
+    return any(phrase in text for phrase in [
+        "không đủ dữ liệu",
+        "không tìm thấy",
+        "do not know",
+        "insufficient",
+        "không có thông tin",
+    ])
+
 # =============================================================================
 # CẤU HÌNH
 # =============================================================================
@@ -43,11 +78,11 @@ BASELINE_CONFIG = {
 # Cấu hình variant (Sprint 3 — điều chỉnh theo lựa chọn của nhóm)
 # TODO Sprint 4: Cập nhật VARIANT_CONFIG theo variant nhóm đã implement
 VARIANT_CONFIG = {
-    "retrieval_mode": "hybrid",   # Hoặc "dense" nếu chỉ đổi rerank
+    "retrieval_mode": "hybrid",
     "top_k_search": 10,
     "top_k_select": 3,
-    "use_rerank": True,           # Hoặc False nếu variant là hybrid không rerank
-    "label": "variant_hybrid_rerank",
+    "use_rerank": False,
+    "label": "variant_hybrid",
 }
 
 
@@ -88,11 +123,33 @@ def score_faithfulness(
 
     Trả về dict với: score (1-5) và notes (lý do)
     """
-    # TODO Sprint 4: Implement scoring
-    # Tạm thời trả về None (yêu cầu chấm thủ công)
+    if not chunks_used:
+        score = 5 if _is_insufficient_answer(answer) else 1
+        return {
+            "score": score,
+            "notes": "No chunks used; score based on abstain behavior",
+        }
+
+    context = "\n".join(c.get("text", "") for c in chunks_used).lower()
+    answer_tokens = {t for t in _tokens(answer) if len(t) > 3}
+    if not answer_tokens:
+        return {"score": 1, "notes": "Empty answer"}
+
+    grounded = sum(1 for t in answer_tokens if t in context) / len(answer_tokens)
+    if grounded >= 0.8:
+        score = 5
+    elif grounded >= 0.65:
+        score = 4
+    elif grounded >= 0.45:
+        score = 3
+    elif grounded >= 0.25:
+        score = 2
+    else:
+        score = 1
+
     return {
-        "score": None,
-        "notes": "TODO: Chấm thủ công hoặc implement LLM-as-Judge",
+        "score": score,
+        "notes": f"Heuristic grounded token ratio: {grounded:.2f}",
     }
 
 
@@ -113,9 +170,32 @@ def score_answer_relevance(
 
     TODO Sprint 4: Implement tương tự score_faithfulness
     """
+    if _is_insufficient_answer(answer):
+        return {
+            "score": 3,
+            "notes": "Answer abstains; manually verify this is expected for the query",
+        }
+
+    query_tokens = {t for t in _tokens(query) if len(t) > 2}
+    answer_tokens = _tokens(answer)
+    if not query_tokens:
+        return {"score": None, "notes": "No query tokens"}
+
+    overlap = len(query_tokens & answer_tokens) / len(query_tokens)
+    if overlap >= 0.5:
+        score = 5
+    elif overlap >= 0.35:
+        score = 4
+    elif overlap >= 0.2:
+        score = 3
+    elif overlap > 0:
+        score = 2
+    else:
+        score = 1
+
     return {
-        "score": None,
-        "notes": "TODO: Implement score_answer_relevance",
+        "score": score,
+        "notes": f"Heuristic query-answer token overlap: {overlap:.2f}",
     }
 
 
@@ -198,9 +278,20 @@ def score_completeness(
          Rate completeness 1-5. Are all key points covered?
          Output: {'score': int, 'missing_points': [str]}"
     """
+    if not expected_answer:
+        return {"score": None, "notes": "No expected answer"}
+
+    if _is_insufficient_answer(expected_answer):
+        score = 5 if _is_insufficient_answer(answer) else 1
+        return {
+            "score": score,
+            "notes": "Expected answer is abstain; scored abstain behavior",
+        }
+
+    result = _keyword_overlap_score(answer, expected_answer)
     return {
-        "score": None,
-        "notes": "TODO: Implement score_completeness (so sánh với expected_answer)",
+        "score": result["score"],
+        "notes": f"Heuristic expected-answer keyword overlap: {result['overlap']:.2f}",
     }
 
 
@@ -441,6 +532,69 @@ Generated: {timestamp}
 
 
 # =============================================================================
+# GRADING LOG GENERATOR
+# =============================================================================
+
+
+def generate_grading_log(
+    questions_path: Path = Path(__file__).parent / "data" / "grading_questions.json",
+    output_path: Path = Path(__file__).parent / "logs" / "grading_run.json",
+    config: Optional[Dict[str, Any]] = None,
+) -> Optional[Path]:
+    """
+    Tạo logs/grading_run.json theo format trong SCORING.md nếu grading_questions.json tồn tại.
+    Dùng cấu hình tốt nhất hiện tại: hybrid retrieval.
+    """
+    if not questions_path.exists():
+        print(f"\nKhông thấy {questions_path.name}; bỏ qua grading log.")
+        print("Khi file grading_questions.json được public, đặt vào data/ rồi chạy lại: python eval.py")
+        return None
+
+    config = config or VARIANT_CONFIG
+    with open(questions_path, "r", encoding="utf-8") as f:
+        questions = json.load(f)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    log = []
+    for q in questions:
+        try:
+            result = rag_answer(
+                q["question"],
+                retrieval_mode=config.get("retrieval_mode", "hybrid"),
+                top_k_search=config.get("top_k_search", 10),
+                top_k_select=config.get("top_k_select", 3),
+                use_rerank=config.get("use_rerank", False),
+                verbose=False,
+            )
+            record = {
+                "id": q.get("id", ""),
+                "question": q.get("question", ""),
+                "answer": result.get("answer", ""),
+                "sources": result.get("sources", []),
+                "chunks_retrieved": len(result.get("chunks_used", [])),
+                "retrieval_mode": result.get("config", {}).get("retrieval_mode", config.get("retrieval_mode", "hybrid")),
+                "timestamp": datetime.now().isoformat(),
+            }
+        except Exception as e:
+            record = {
+                "id": q.get("id", ""),
+                "question": q.get("question", ""),
+                "answer": f"PIPELINE_ERROR: {e}",
+                "sources": [],
+                "chunks_retrieved": 0,
+                "retrieval_mode": config.get("retrieval_mode", "hybrid"),
+                "timestamp": datetime.now().isoformat(),
+            }
+        log.append(record)
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(log, f, ensure_ascii=False, indent=2)
+
+    print(f"\nGrading log lưu tại: {output_path}")
+    return output_path
+
+
+# =============================================================================
 # MAIN — Chạy evaluation
 # =============================================================================
 
@@ -486,30 +640,27 @@ if __name__ == "__main__":
         print("Pipeline chưa implement. Hoàn thành Sprint 2 trước.")
         baseline_results = []
 
-    # --- Chạy Variant (sau khi Sprint 3 hoàn thành) ---
-    # TODO Sprint 4: Uncomment sau khi implement variant trong rag_answer.py
-    # print("\n--- Chạy Variant ---")
-    # variant_results = run_scorecard(
-    #     config=VARIANT_CONFIG,
-    #     test_questions=test_questions,
-    #     verbose=True,
-    # )
-    # variant_md = generate_scorecard_summary(variant_results, VARIANT_CONFIG["label"])
-    # (RESULTS_DIR / "scorecard_variant.md").write_text(variant_md, encoding="utf-8")
+    # --- Chạy Variant ---
+    print("\n--- Chạy Variant ---")
+    variant_results = run_scorecard(
+        config=VARIANT_CONFIG,
+        test_questions=test_questions,
+        verbose=True,
+    )
+    variant_md = generate_scorecard_summary(variant_results, VARIANT_CONFIG["label"])
+    (RESULTS_DIR / "scorecard_variant.md").write_text(variant_md, encoding="utf-8")
+    print(f"\nVariant scorecard lưu tại: {RESULTS_DIR / 'scorecard_variant.md'}")
 
     # --- A/B Comparison ---
-    # TODO Sprint 4: Uncomment sau khi có cả baseline và variant
-    # if baseline_results and variant_results:
-    #     compare_ab(
-    #         baseline_results,
-    #         variant_results,
-    #         output_csv="ab_comparison.csv"
-    #     )
+    if baseline_results and variant_results:
+        compare_ab(
+            baseline_results,
+            variant_results,
+            output_csv="ab_comparison.csv"
+        )
 
-    print("\n\nViệc cần làm Sprint 4:")
-    print("  1. Hoàn thành Sprint 2 + 3 trước")
-    print("  2. Chấm điểm thủ công hoặc implement LLM-as-Judge trong score_* functions")
-    print("  3. Chạy run_scorecard(BASELINE_CONFIG)")
-    print("  4. Chạy run_scorecard(VARIANT_CONFIG)")
-    print("  5. Gọi compare_ab() để thấy delta")
-    print("  6. Cập nhật docs/tuning-log.md với kết quả và nhận xét")
+    generate_grading_log(config=VARIANT_CONFIG)
+
+    print("\n\nSprint 4 eval đã chạy xong.")
+    print("Scorecard baseline/variant và A/B comparison đã được tạo trong results/.")
+    print("Nếu có data/grading_questions.json, logs/grading_run.json cũng đã được tạo.")
